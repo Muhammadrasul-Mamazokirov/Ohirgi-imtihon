@@ -1,0 +1,52 @@
+[
+    {
+        "question": "Python dasturlash tilining yaratuvchisi kim?",
+        "options": ["Guido van Rossum", "Linus Torvalds", "Bill Gates", "Mark Zuckerberg"],
+        "answer": "Guido van Rossum"
+    },
+    {
+        "question": "O'zbekiston qachon mustaqillikka erishgan?",
+        "options": ["1991 yil", "1989 yil", "1992 yil", "1990 yil"],
+        "answer": "1991 yil"
+    },
+    {
+        "question": "Dunyodagi eng katta okean qaysi?",
+        "options": ["Tinch okeani", "Atlantika okeani", "Hind okeani", "Shimoliy Muz okeani"],
+        "answer": "Tinch okeani"
+    },
+    {
+        "question": "Yerdagi eng tez yuguradigan hayvon qaysi?",
+        "options": ["Gepard", "Sher", "Qoplon", "Kiyik"],
+        "answer": "Gepard"
+    },
+    {
+        "question": "HTML qanday til hisoblanadi?",
+        "options": ["Belgilash tili", "Dasturlash tili", "Ma'lumotlar bazasi tili", "Dizayn tili"],
+        "answer": "Belgilash tili"
+    },
+    {
+        "question": "H2O qaysi moddaning kimyoviy formulasi?",
+        "options": ["Suv", "Vodorod peroksid", "Tuz", "Shakar"],
+        "answer": "Suv"
+    },
+    {
+        "question": "Aiogram qaysi dasturlash tilining kutubxonasi?",
+        "options": ["Python", "JavaScript", "Java", "C++"],
+        "answer": "Python"
+    },
+    {
+        "question": "Quyosh tizimidagi eng katta sayyora qaysi?",
+        "options": ["Yupiter", "Saturn", "Yer", "Mars"],
+        "answer": "Yupiter"
+    },
+    {
+        "question": "Telegram messenjeri asoschisi kim?",
+        "options": ["Pavel Durov", "Ilon Mask", "Stiv Jobs", "Jan Kum"],
+        "answer": "Pavel Durov"
+    },
+    {
+        "question": "1 Kilobayt (KB) necha baytga teng?",
+        "options": ["1024", "1000", "128", "256"],
+        "answer": "1024"
+    }
+]
