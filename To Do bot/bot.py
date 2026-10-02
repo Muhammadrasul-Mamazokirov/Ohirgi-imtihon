@@ -11,10 +11,14 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile
+import json
+from openai import AsyncOpenAI
 
 # ==================== SOZLAMALAR ====================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -166,6 +170,80 @@ async def start_handler(message: types.Message, state: FSMContext):
     conn.commit()
     conn.close()
     await message.answer("Premium Todo Botga xush kelibsiz! /help orqali qo'llanmani o'qing.", reply_markup=main_kb)
+
+# ---------- OVOZLI XABAR ORQALI VAZIFA QO'SHISH ----------
+@dp.message(F.voice)
+async def handle_voice_task(message: types.Message):
+    msg = await message.answer("🎙 <i>Ovozli xabaringiz tahlil qilinmoqda, kuting...</i>", parse_mode="HTML")
+    
+    # 1. Ovozli xabarni yuklab olish
+    file_id = message.voice.file_id
+    file_info = await bot.get_file(file_id)
+    filepath = f"temp_voice_{file_id}.ogg"
+    await bot.download_file(file_info.file_path, filepath)
+
+    try:
+        # 2. Whisper orqali ovozni matnga o'girish
+        with open(filepath, "rb") as audio_file:
+            transcription = await client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file,
+                response_format="text"
+            )
+        
+        # 3. GPT orqali matnni tahlil qilib JSON formatiga keltirish
+        now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        system_prompt = f"""
+        Siz aqlli vazifa menejerisiz. Bugungi sana va vaqt: {now_str}.
+        Foydalanuvchi matnidan quyidagi ma'lumotlarni ajratib oling va FAQT JSON formatida qaytaring:
+        {{
+            "name": "Vazifa nomi",
+            "deadline": "DD.MM.YYYY HH:MM (agar vaqt ko'rsatilmagan bo'lsa null)",
+            "category": "💼 Ish, 📚 O'qish, 🏠 Uy, 🛒 Xaridlar yoki ➕ Boshqa",
+            "priority": "🔴 Yuqori, 🟡 O'rtacha yoki 🟢 Past"
+        }}
+        Matn: "{transcription}"
+        """
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", # Tez va arzon model
+            messages=[{"role": "system", "content": system_prompt}],
+            response_format={ "type": "json_object" }
+        )
+        
+        # 4. Natijani ajratib olish va bazaga saqlash
+        task_data = json.loads(response.choices[0].message.content)
+        
+        name = task_data.get("name", transcription)
+        deadline = task_data.get("deadline")
+        category = task_data.get("category", "➕ Boshqa")
+        priority = task_data.get("priority", "🟡 O'rtacha")
+        recurring = "❌ Bir marta" # Ovozli orqali hozircha bir martalik
+        
+        user_id = message.from_user.id
+        conn = sqlite3.connect('todo.db')
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(MAX(local_id), 0) + 1 FROM tasks WHERE user_id=?", (user_id,))
+        next_local_id = c.fetchone()[0]
+
+        c.execute("INSERT INTO tasks (user_id, local_id, name, category, priority, recurring, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, next_local_id, name, category, priority, recurring, deadline))
+        conn.commit()
+        conn.close()
+
+        dl_text = deadline if deadline else "Vaqt biriktirilmagan"
+        await msg.edit_text(f"✅ <b>Aqlli vazifa qo'shildi!</b> (ID: {next_local_id})\n\n"
+                            f"📝 {name}\n"
+                            f"📂 {category} | {priority}\n"
+                            f"⏳ Muddat: {dl_text}", parse_mode="HTML", reply_markup=main_kb)
+
+    except Exception as e:
+        logging.error(f"Ovozli xatosi: {e}")
+        await msg.edit_text("⚠ <i>Kechirasiz, ovozli xabarni tahlil qilishda xatolik yuz berdi. Matn orqali urinib ko'ring.</i>", parse_mode="HTML")
+    finally:
+        # Axlat faylni o'chiramiz
+        if os.path.exists(filepath):
+            os.remove(filepath)
 
 @dp.message(Command("cancel"))
 async def cancel_handler(message: types.Message, state: FSMContext):
