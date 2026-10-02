@@ -38,17 +38,17 @@ def init_db():
                         notified INTEGER DEFAULT 0
                     )''')
         
-        # Yangi funksiyalar uchun ustunlarni avtomatik qo'shish (eski baza bilan ishlashi uchun)
         new_columns = [
             ("category", "TEXT DEFAULT '➕ Boshqa'"),
             ("priority", "TEXT DEFAULT '🟢 Past'"),
-            ("recurring", "TEXT DEFAULT '❌ Bir marta'")
+            ("recurring", "TEXT DEFAULT '❌ Bir marta'"),
+            ("local_id", "INTEGER DEFAULT 0") # <- YANGI USTUN
         ]
         for col_name, col_type in new_columns:
             try:
                 c.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
             except sqlite3.OperationalError:
-                pass # Ustun allaqachon bo'lsa, davom etadi
+                pass
         
         conn.commit()
     except Exception as e:
@@ -129,15 +129,15 @@ def priority_value(prio_str):
 def get_tasks_text(user_id, page=1, limit=5):
     conn = sqlite3.connect('todo.db')
     c = conn.cursor()
-    c.execute("SELECT id, name, deadline, category, priority, recurring FROM tasks WHERE user_id=? AND status=0", (user_id,))
+    # Endi local_id ni ham o'qiymiz
+    c.execute("SELECT id, local_id, name, deadline, category, priority, recurring FROM tasks WHERE user_id=? AND status=0", (user_id,))
     tasks = c.fetchall()
     conn.close()
 
     if not tasks:
         return "🎉 Sizda hozircha faol vazifalar yo'q!", None
 
-    # Muhimligi (priority) bo'yicha saralash
-    tasks.sort(key=lambda x: priority_value(x[4]))
+    tasks.sort(key=lambda x: priority_value(x[5]))
     
     total_pages = (len(tasks) + limit - 1) // limit
     if page > total_pages: page = total_pages
@@ -148,9 +148,10 @@ def get_tasks_text(user_id, page=1, limit=5):
 
     text = f"📋 <b>Sizning faol vazifalaringiz (Sahifa: {page}/{total_pages}):</b>\n\n"
     for task in page_tasks:
-        t_id, name, deadline, cat, prio, rec = task
+        real_id, local_id, name, deadline, cat, prio, rec = task
         dl_text = deadline if deadline else "Vaqt yo'q"
-        text += f"🆔 <b>ID: {t_id}</b> | {prio} | {cat}\n📝 {name}\n⏳ {dl_text} | 🔄 {rec}\n〰〰〰〰〰〰〰〰〰〰〰\n"
+        # Userga local_id ni ko'rsatamiz
+        text += f"🆔 <b>ID: {local_id}</b> | {prio} | {cat}\n📝 {name}\n⏳ {dl_text} | 🔄 {rec}\n〰〰〰〰〰〰〰〰〰〰〰\n"
     
     text += "\n👇 <i>Vazifani boshqarish uchun chatga uning <b>ID raqamini</b> yuboring.</i>"
     kb = pagination_kb(page, total_pages) if total_pages > 1 else None
@@ -219,12 +220,20 @@ async def process_task_deadline(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     try:
+        user_id = message.from_user.id
         conn = sqlite3.connect('todo.db')
-        conn.execute("INSERT INTO tasks (user_id, name, category, priority, recurring, deadline) VALUES (?, ?, ?, ?, ?, ?)",
-                  (message.from_user.id, data['name'], data['category'], data['priority'], data['recurring'], deadline))
+        c = conn.cursor()
+        
+        # Foydalanuvchining shaxsiy oxirgi ID sini topish
+        c.execute("SELECT COALESCE(MAX(local_id), 0) + 1 FROM tasks WHERE user_id=?", (user_id,))
+        next_local_id = c.fetchone()[0]
+
+        c.execute("INSERT INTO tasks (user_id, local_id, name, category, priority, recurring, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, next_local_id, data['name'], data['category'], data['priority'], data['recurring'], deadline))
         conn.commit()
         conn.close()
-        await message.answer("✅ <b>Vazifa muvaffaqiyatli qo'shildi!</b>", parse_mode="HTML", reply_markup=main_kb)
+        
+        await message.answer(f"✅ <b>Vazifa muvaffaqiyatli qo'shildi!</b> (Shaxsiy ID: {next_local_id})", parse_mode="HTML", reply_markup=main_kb)
         await state.clear()
     except Exception as e:
         logging.error(f"Save error: {e}")
@@ -250,25 +259,28 @@ async def page_callback(callback: types.CallbackQuery):
 # ---------- VAZIFA ID SI KIRITILGANDA ----------
 @dp.message(F.text.regexp(r'^\d+$'))
 async def task_id_handler(message: types.Message):
-    task_id = int(message.text)
+    user_local_id = int(message.text)
     conn = sqlite3.connect('todo.db')
     c = conn.cursor()
-    c.execute("SELECT name, deadline, category, priority, recurring FROM tasks WHERE id=? AND user_id=? AND status=0", (task_id, message.from_user.id))
+    # local_id bo'yicha qidiramiz, lekin real id ni olib qolamiz
+    c.execute("SELECT id, name, deadline, category, priority, recurring FROM tasks WHERE local_id=? AND user_id=? AND status=0", 
+              (user_local_id, message.from_user.id))
     task = c.fetchone()
     conn.close()
 
     if task:
-        name, deadline, cat, prio, rec = task
+        real_id, name, deadline, cat, prio, rec = task
         dl_text = deadline if deadline else "Biriktirilmagan"
-        text = (f"📌 <b>Tanlangan vazifa (ID: {task_id}):</b>\n\n"
+        text = (f"📌 <b>Tanlangan vazifa (ID: {user_local_id}):</b>\n\n"
                 f"📝 <b>Nomi:</b> {name}\n"
                 f"📂 <b>Kategoriya:</b> {cat}\n"
                 f"🔥 <b>Muhimlik:</b> {prio}\n"
                 f"🔄 <b>Takrorlanish:</b> {rec}\n"
                 f"⏳ <b>Muddat:</b> {dl_text}\n\nQanday amal bajaramiz?")
-        await message.answer(text, parse_mode="HTML", reply_markup=task_action_kb(task_id))
+        # Tugmalarga real_id ketadi, bu esa xatosiz ishlashini taminlaydi
+        await message.answer(text, parse_mode="HTML", reply_markup=task_action_kb(real_id))
     else:
-        await message.answer("⚠ Bunday ID raqamli faol vazifa topilmadi.")
+        await message.answer("⚠ Bunday ID raqamli faol vazifangiz topilmadi.")
 
 # ---------- TAHRIRLASH ----------
 @dp.callback_query(F.data.startswith("edit_"))
