@@ -20,6 +20,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 # ==================== SOZLAMALAR ====================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+# Admin ID ni .env faylidan o'qiydi. Agar u yerda yozilmagan bo'lsa, 0 deb oladi.
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -30,8 +32,6 @@ def init_db():
     try:
         conn = sqlite3.connect('quiz.db')
         c = conn.cursor()
-        
-        # Natijalar jadvali
         c.execute('''CREATE TABLE IF NOT EXISTS results (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER,
@@ -41,8 +41,6 @@ def init_db():
                         grade TEXT,
                         date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )''')
-                    
-        # Savollar jadvali (YANGI QO'SHILDI)
         c.execute('''CREATE TABLE IF NOT EXISTS questions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         question TEXT,
@@ -52,7 +50,6 @@ def init_db():
                         opt_d TEXT,
                         answer TEXT
                     )''')
-                    
         conn.commit()
     except Exception as e:
         logging.error(f"Baza xatosi: {e}")
@@ -60,7 +57,6 @@ def init_db():
         conn.close()
 
 def load_questions():
-    """Barcha savollarni quiz.db bazasidan o'qib kelish"""
     conn = sqlite3.connect('quiz.db')
     c = conn.cursor()
     c.execute("SELECT question, opt_a, opt_b, opt_c, opt_d, answer FROM questions")
@@ -77,7 +73,6 @@ def load_questions():
     return questions
 
 def save_questions(new_questions):
-    """Yangi savollarni quiz.db bazasiga saqlash"""
     conn = sqlite3.connect('quiz.db')
     c = conn.cursor()
     for q in new_questions:
@@ -96,11 +91,12 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="quiz", description="Yangi testni boshlash"),
         BotCommand(command="add", description="Ruchnoy savol qo'shish"),
         BotCommand(command="results", description="Oxirgi natijalarim"),
+        BotCommand(command="admin", description="Admin panel"),
         BotCommand(command="cancel", description="Boshlangan amalni bekor qilish")
     ]
     await bot.set_my_commands(commands)
 
-# ==================== KEYBOARDLAR ====================
+# ==================== KEYBOARDLAR (ASOSIY) ====================
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎯 Testni boshlash")],
@@ -110,19 +106,71 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-stop_quiz_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🛑 Testni yakunlash")]],
-    resize_keyboard=True
-)
-
-back_cancel_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🔙 Ortga"), KeyboardButton(text="❌ Bekor qilish")]],
-    resize_keyboard=True
-)
+stop_quiz_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🛑 Testni yakunlash")]], resize_keyboard=True)
+back_cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Ortga"), KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
 
 def generate_quiz_kb(options):
     buttons = [[InlineKeyboardButton(text=opt, callback_data=f"ans_{idx}")] for idx, opt in enumerate(options)]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ==================== ADMIN PANEL KEYBOARDLARI ====================
+admin_main_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🗑 Barcha savollarni tozalash", callback_data="admin_clear_all")],
+    [InlineKeyboardButton(text="✂️ Bittalab tanlab o'chirish", callback_data="admin_page_1")]
+])
+
+admin_confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✅ Ha, hammasini o'chirish", callback_data="confirm_clear_all")],
+    [InlineKeyboardButton(text="❌ Yo'q, qaytish", callback_data="admin_panel")]
+])
+
+def get_admin_questions_kb(page=1, limit=5):
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM questions")
+    total = c.fetchone()[0]
+    
+    if total == 0:
+        conn.close()
+        return "📭 Bazada hech qanday savol yo'q.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Admin Panelga qaytish", callback_data="admin_panel")]])
+        
+    total_pages = (total + limit - 1) // limit
+    if page > total_pages: page = total_pages
+    if page < 1: page = 1
+    
+    offset = (page - 1) * limit
+    c.execute("SELECT id, question FROM questions LIMIT ? OFFSET ?", (limit, offset))
+    questions = c.fetchall()
+    conn.close()
+    
+    text = f"📂 <b>Bzadagi savollar ro'yxati (Sahifa: {page}/{total_pages}):</b>\n\n"
+    buttons = []
+    row = []
+    
+    for q in questions:
+        q_id, q_text = q
+        short_q = q_text[:35] + "..." if len(q_text) > 35 else q_text
+        text += f"🆔 <b>{q_id}</b>: {short_q}\n"
+        
+        row.append(InlineKeyboardButton(text=f"🗑 {q_id}", callback_data=f"admin_del_{q_id}_{page}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+            
+    if row:
+        buttons.append(row)
+        
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"admin_page_{page-1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"admin_page_{page+1}"))
+        
+    if nav_row:
+        buttons.append(nav_row)
+        
+    buttons.append([InlineKeyboardButton(text="🔙 Admin Panelga qaytish", callback_data="admin_panel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ==================== FSM HOLATLARI ====================
 class QuizState(StatesGroup):
@@ -139,7 +187,64 @@ class AddQState(StatesGroup):
 class UploadState(StatesGroup):
     waiting_file = State()
 
-# ==================== TEST YAKUNLASH MANTIG'I ====================
+# ==================== AQLLI FAYL O'QISH MANTIG'I ====================
+def parse_text_block(text):
+    questions = []
+    blocks = re.split(r'\n\s*(?:Savol:|\d+[\.\)])\s*', "\n" + text, flags=re.IGNORECASE)
+    for block in blocks:
+        if not block.strip(): continue
+        try:
+            pattern = r'\n?\s*([\*\+]?)([A-D])[\)\.](.*?)(?=\n\s*[\*\+]?[A-D][\)\.]|\n\s*(?:Javob|To\'g\'ri)|$)'
+            opts_match = re.findall(pattern, block, flags=re.IGNORECASE | re.DOTALL)
+            
+            if len(opts_match) >= 4:
+                q_text = re.split(r'\n?\s*[\*\+]?A[\)\.]', block, flags=re.IGNORECASE)[0].strip()
+                options = []
+                correct_ans = None
+                
+                for marker, letter, opt_text in opts_match[:4]: 
+                    clean_opt = opt_text.strip()
+                    options.append(clean_opt)
+                    if marker in ['*', '+']: 
+                        correct_ans = clean_opt
+                        
+                if not correct_ans:
+                    ans_match = re.search(r'(?:Javob|To\'g\'ri|Javobi)[\s:]*([A-D])', block, flags=re.IGNORECASE)
+                    if ans_match:
+                        ans_letter = ans_match.group(1).upper()
+                        idx = {'A':0, 'B':1, 'C':2, 'D':3}[ans_letter]
+                        correct_ans = options[idx]
+                        
+                if q_text and len(options) == 4 and correct_ans:
+                    questions.append({
+                        "question": q_text,
+                        "options": options,
+                        "answer": correct_ans
+                    })
+        except Exception:
+            pass
+    return questions
+
+def parse_excel(filepath):
+    questions = []
+    wb = openpyxl.load_workbook(filepath)
+    ws = wb.active
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if len(row) >= 6 and all(row[:6]):
+            try:
+                opts = [str(row[1]).strip(), str(row[2]).strip(), str(row[3]).strip(), str(row[4]).strip()]
+                ans_val = str(row[5]).strip().upper()
+                correct = opts[{'A':0, 'B':1, 'C':2, 'D':3}[ans_val]] if ans_val in ['A','B','C','D'] else str(row[5]).strip()
+                questions.append({
+                    "question": str(row[0]).strip(),
+                    "options": opts,
+                    "answer": correct
+                })
+            except Exception:
+                pass
+    return questions
+
+# ==================== TEST MANTIG'I ====================
 async def finish_quiz(message_or_call, state: FSMContext, forced=False):
     data = await state.get_data()
     correct_answers = data.get('correct_answers', 0)
@@ -207,67 +312,80 @@ async def send_next_question(message_or_call, state: FSMContext):
     else:
         await message_or_call.answer(text, parse_mode="HTML", reply_markup=kb)
 
-# ==================== AQLLI FAYL O'QISH MANTIG'I ====================
-def parse_text_block(text):
-    questions = []
-    blocks = re.split(r'\n\s*(?:(?i)Savol:|\d+[\.\)])\s*', "\n" + text)
-    for block in blocks:
-        if not block.strip(): continue
-        try:
-            opts_match = re.findall(r'(?i)\n?\s*([\*\+]?)([A-D])[\)\.](.*?)(?=\n\s*[\*\+]?[A-D][\)\.]|\n\s*(?:Javob|To\'g\'ri)|$)', block, re.DOTALL)
-            if len(opts_match) >= 4:
-                q_text = re.split(r'(?i)\n?\s*[\*\+]?A[\)\.]', block)[0].strip()
-                options = []
-                correct_ans = None
-                for marker, letter, opt_text in opts_match[:4]: 
-                    clean_opt = opt_text.strip()
-                    options.append(clean_opt)
-                    if marker in ['*', '+']: 
-                        correct_ans = clean_opt
-                if not correct_ans:
-                    ans_match = re.search(r'(?i)(?:Javob|To\'g\'ri|Javobi)[\s:]*([A-D])', block)
-                    if ans_match:
-                        ans_letter = ans_match.group(1).upper()
-                        idx = {'A':0, 'B':1, 'C':2, 'D':3}[ans_letter]
-                        correct_ans = options[idx]
-                if q_text and len(options) == 4 and correct_ans:
-                    questions.append({
-                        "question": q_text,
-                        "options": options,
-                        "answer": correct_ans
-                    })
-        except Exception:
-            pass
-    return questions
+# ==================== ADMIN PANEL HANDLERLARI ====================
+@dp.message(Command("admin"))
+async def admin_handler(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM questions")
+    total = c.fetchone()[0]
+    conn.close()
+    
+    await message.answer(f"🛠 <b>Admin Panelga xush kelibsiz!</b>\n\nBazada jami <b>{total} ta</b> savol mavjud. Nima ish bajaramiz?", 
+                         parse_mode="HTML", reply_markup=admin_main_kb)
 
-def parse_excel(filepath):
-    questions = []
-    wb = openpyxl.load_workbook(filepath)
-    ws = wb.active
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if len(row) >= 6 and all(row[:6]):
-            try:
-                opts = [str(row[1]).strip(), str(row[2]).strip(), str(row[3]).strip(), str(row[4]).strip()]
-                ans_val = str(row[5]).strip().upper()
-                correct = opts[{'A':0, 'B':1, 'C':2, 'D':3}[ans_val]] if ans_val in ['A','B','C','D'] else str(row[5]).strip()
-                questions.append({
-                    "question": str(row[0]).strip(),
-                    "options": opts,
-                    "answer": correct
-                })
-            except Exception:
-                pass
-    return questions
+@dp.callback_query(F.data == "admin_panel")
+async def back_to_admin_panel(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM questions")
+    total = c.fetchone()[0]
+    conn.close()
+    await callback.message.edit_text(f"🛠 <b>Admin Panelga xush kelibsiz!</b>\n\nBazada jami <b>{total} ta</b> savol mavjud. Nima ish bajaramiz?", 
+                                     parse_mode="HTML", reply_markup=admin_main_kb)
 
-# ==================== ASOSIY COMMANDLAR VA HANDLERLAR ====================
+@dp.callback_query(F.data == "admin_clear_all")
+async def admin_clear_all_confirm(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    await callback.message.edit_text("⚠ <b>DIQQAT!</b>\n\nBarcha savollarni bazadan o'chirib tashlaysizmi? Bu amalni ortga qaytarib bo'lmaydi!", 
+                                     parse_mode="HTML", reply_markup=admin_confirm_kb)
 
+@dp.callback_query(F.data == "confirm_clear_all")
+async def execute_clear_all(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM questions")
+    c.execute("DELETE FROM sqlite_sequence WHERE name='questions'")
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text("✅ <b>Barcha savollar bazadan o'chirildi!</b> Bazangiz bo'm-bo'sh.", 
+                                     parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Qaytish", callback_data="admin_panel")]]))
+
+@dp.callback_query(F.data.startswith("admin_page_"))
+async def admin_pagination(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    page = int(callback.data.split("_")[2])
+    text, kb = get_admin_questions_kb(page=page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("admin_del_"))
+async def admin_delete_single(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    parts = callback.data.split("_")
+    q_id = int(parts[2])
+    current_page = int(parts[3])
+    
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM questions WHERE id=?", (q_id,))
+    conn.commit()
+    conn.close()
+    
+    await callback.answer(f"ID: {q_id} savol o'chirildi!", show_alert=False)
+    text, kb = get_admin_questions_kb(page=current_page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+# ==================== QOLGAN HANDLERLAR ====================
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Assalomu alaykum! Imtihon va Test botiga xush kelibsiz.\n\n"
                          "Qo'llanma bilan tanishish uchun /help buyrug'ini bosing.", reply_markup=main_kb)
 
-# ---------- YORDAM (HELP) ----------
 @dp.message(Command("help"))
 async def help_handler(message: types.Message):
     text = (
@@ -295,7 +413,6 @@ async def help_handler(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# ---------- BEKOR QILISH (CANCEL) ----------
 @dp.message(Command("cancel"))
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel_handler(message: types.Message, state: FSMContext):
@@ -306,7 +423,6 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Jarayon to'xtatildi. Bosh menyudasiz.", reply_markup=main_kb)
 
-# ---------- 1. TEST ISHLASH VA TO'XTATISH ----------
 @dp.message(Command("quiz"))
 @dp.message(F.text == "🎯 Testni boshlash")
 async def start_quiz_handler(message: types.Message, state: FSMContext):
@@ -353,7 +469,7 @@ async def process_answer(callback: types.CallbackQuery, state: FSMContext):
     finally:
         await callback.answer()
 
-# ---------- 2. RUCHNOY SAVOL QO'SHISH ----------
+# ---------- RUCHNOY SAVOL QO'SHISH ----------
 @dp.message(Command("add"))
 @dp.message(F.text == "➕ Savol qo'shish")
 async def add_q_start(message: types.Message, state: FSMContext):
@@ -428,23 +544,20 @@ async def add_q_correct(message: types.Message, state: FSMContext):
     data = await state.get_data()
     opts_dict = {'A': data['opt_a'], 'B': data['opt_b'], 'C': data['opt_c'], 'D': data['opt_d']}
     
-    new_q = {
+    new_q = [{
         "question": data['q_text'],
         "options": [data['opt_a'], data['opt_b'], data['opt_c'], data['opt_d']],
         "answer": opts_dict[ans]
-    }
+    }]
     
-    save_questions([new_q])
+    save_questions(new_q)
     await message.answer("✅ Savol muvaffaqiyatli bazaga qo'shildi!", reply_markup=main_kb)
     await state.clear()
 
-# ---------- 3. FAYL ORQALI YUKLASH ----------
+# ---------- FAYL ORQALI YUKLASH ----------
 @dp.message(F.text == "📁 Fayldan yuklash")
 async def upload_start(message: types.Message, state: FSMContext):
     text = ("📥 <b>Faylni botga yuboring (.pdf, .docx, .xlsx)</b>\n\n"
-            "📌 <i>Excel shabloni:</i>\n"
-            "1-ustun: Savol | 2..5-ustunlar: A,B,C,D | 6-ustun: Javob\n\n"
-            "Shablonlarni to'liq ko'rish uchun /help ni bosing.\n\n"
             "(Bekor qilish uchun ❌ Bekor qilish yoki /cancel bosing)")
     await message.answer(text, parse_mode="HTML", reply_markup=back_cancel_kb)
     await state.set_state(UploadState.waiting_file)
@@ -479,7 +592,11 @@ async def process_file(message: types.Message, state: FSMContext):
 
         if questions_added:
             save_questions(questions_added)
-            await msg.edit_text(f"✅ Fayldan muvaffaqiyatli <b>{len(questions_added)} ta</b> savol bazaga qo'shildi!", parse_mode="HTML")
+            
+            await state.update_data(file_questions=questions_added)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Fayldagi testni boshlash", callback_data="start_file_quiz")]])
+            
+            await msg.edit_text(f"✅ Fayldan muvaffaqiyatli <b>{len(questions_added)} ta</b> savol bazaga qo'shildi!\n\nAynan shu fayldagi savollardan test ishlash uchun quyidagi tugmani bosing:", parse_mode="HTML", reply_markup=kb)
         else:
             await msg.edit_text("⚠ Fayl ichidan shablonga mos savol topilmadi. Shablonni tekshirib qayta urinib ko'ring (/help).")
     except Exception as e:
@@ -489,7 +606,27 @@ async def process_file(message: types.Message, state: FSMContext):
             os.remove(filepath)
         
     await message.answer("Bosh menyudasiz:", reply_markup=main_kb)
-    await state.clear()
+    # MUHIM: Xotirada saqlangan fayl savollarini o'chirmasligi uchun None ishlatamiz
+    await state.set_state(None)
+
+@dp.callback_query(F.data == "start_file_quiz")
+async def start_file_quiz_handler(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_questions = data.get('file_questions', [])
+    
+    if not file_questions:
+        await callback.answer("⚠ Savollar topilmadi yoki xotiradan o'chirilgan!", show_alert=True)
+        return
+
+    random.shuffle(file_questions)
+    await state.update_data(questions=file_questions, current_index=0, correct_answers=0)
+    await state.set_state(QuizState.testing)
+    
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🚀 Fayldagi test boshlandi! Jami savollar: {len(file_questions)} ta.\n"
+                         f"Tugallash uchun pastdagi tugmani bosing.", reply_markup=stop_quiz_kb)
+    await send_next_question(callback.message, state)
+    await callback.answer()
 
 # ---------- NATIJALAR ----------
 @dp.message(Command("results"))
@@ -517,10 +654,9 @@ async def my_results_handler(message: types.Message, state: FSMContext):
 # ==================== MAIN ====================
 async def main():
     init_db()
-    # json modulini import qilganmiz, lekin endi ishlatmaymiz. Eski json faylni o'qish funksiyasi olib tashlandi.
     await set_bot_commands(bot)
     try:
-        print("🚀 Super Quiz Bot (DB only + Commands + Smart Parser) ishga tushdi...")
+        print("🚀 Super Quiz Bot ishga tushdi...")
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Bot kutilmaganda to'xtadi: {e}")
