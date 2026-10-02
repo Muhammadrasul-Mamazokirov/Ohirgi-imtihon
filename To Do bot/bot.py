@@ -141,6 +141,7 @@ def get_tasks_text(user_id, page=1, limit=5):
     
     total_pages = (len(tasks) + limit - 1) // limit
     if page > total_pages: page = total_pages
+    if page < 1: page = 1
     
     start_idx = (page - 1) * limit
     page_tasks = tasks[start_idx:start_idx + limit]
@@ -170,7 +171,7 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Jarayon bekor qilindi.", reply_markup=main_kb)
 
-# ---------- VAZIFA QO'SHISH (Zanjirli qadamlar) ----------
+# ---------- VAZIFA QO'SHISH ----------
 @dp.message(Command("add"))
 @dp.message(F.text == "Vazifa qo'shish")
 async def add_task_start(message: types.Message, state: FSMContext):
@@ -231,9 +232,14 @@ async def process_task_deadline(message: types.Message, state: FSMContext):
 # ---------- VAZIFALARIM RO'YXATI VA SAHIFALASH ----------
 @dp.message(Command("list"))
 @dp.message(F.text == "Vazifalarim")
-async def my_tasks_handler(message: types.Message):
-    text, kb = get_tasks_text(message.from_user.id, page=1)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+async def my_tasks_handler(message: types.Message, state: FSMContext):
+    await state.clear() # <- Qotib qolgan jarayonlarni tozalaydi
+    try:
+        text, kb = get_tasks_text(message.from_user.id, page=1)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Ro'yxat xatosi: {e}")
+        await message.answer("⚠ Vazifalarni yuklashda xatolik yuz berdi.", reply_markup=main_kb)
 
 @dp.callback_query(F.data.startswith("page_"))
 async def page_callback(callback: types.CallbackQuery):
@@ -264,7 +270,75 @@ async def task_id_handler(message: types.Message):
     else:
         await message.answer("⚠ Bunday ID raqamli faol vazifa topilmadi.")
 
-# ---------- CALLBACKLAR (Bajarildi, Snooze, Tahrir) ----------
+# ---------- TAHRIRLASH ----------
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit_task_callback(callback: types.CallbackQuery, state: FSMContext):
+    task_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_task_id=task_id)
+    
+    text = ("✏️ Vazifaning <b>yangi nomini</b> kiriting:\n"
+            "<i>(O'zgarishsiz qoldirish uchun <b>-</b>, bekor qilish uchun /cancel yuboring)</i>")
+    
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(EditTaskStates.name)
+    await callback.answer()
+
+@dp.message(EditTaskStates.name)
+async def process_edit_name(message: types.Message, state: FSMContext):
+    new_name = None if message.text == "-" else message.text
+    await state.update_data(edit_name=new_name)
+    
+    text = ("⏳ Vazifaning <b>yangi muddatini</b> (KK.OO.YYYY SS:MM) kiriting:\n"
+            "<i>(O'zgarishsiz qoldirish uchun <b>-</b> belgisini yuboring)</i>")
+    await message.answer(text, parse_mode="HTML")
+    await state.set_state(EditTaskStates.deadline)
+
+@dp.message(EditTaskStates.deadline)
+async def process_edit_deadline(message: types.Message, state: FSMContext):
+    text = message.text
+    new_deadline = None
+    
+    if text != "-":
+        if text.lower() == "o'tkazib yuborish":
+            new_deadline = "clear"
+        else:
+            try:
+                dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+                if dt < datetime.now():
+                    await message.answer("O'tib ketgan vaqt! Qaytadan kelajakdagi vaqtni kiriting:")
+                    return
+                new_deadline = text
+            except ValueError:
+                await message.answer("Noto'g'ri format! KK.OO.YYYY SS:MM formatida yozing (yoki - yuboring):")
+                return
+
+    data = await state.get_data()
+    task_id = data['edit_task_id']
+    new_name = data['edit_name']
+
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT name, deadline FROM tasks WHERE id=?", (task_id,))
+    old_task = c.fetchone()
+
+    final_name = new_name if new_name else old_task[0]
+    
+    if new_deadline == "clear":
+        final_deadline = None
+    elif new_deadline:
+        final_deadline = new_deadline
+    else:
+        final_deadline = old_task[1]
+
+    c.execute("UPDATE tasks SET name=?, deadline=?, notified=0 WHERE id=? AND user_id=?", 
+              (final_name, final_deadline, task_id, message.from_user.id))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ <b>Vazifa muvaffaqiyatli tahrirlandi!</b>", parse_mode="HTML", reply_markup=main_kb)
+    await state.clear()
+
+# ---------- CALLBACKLAR (Bajarildi, Snooze, O'chirish) ----------
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done_callback(callback: types.CallbackQuery):
     task_id = int(callback.data.split("_")[1])
@@ -275,7 +349,6 @@ async def mark_done_callback(callback: types.CallbackQuery):
     
     if task:
         deadline_str, recurring = task
-        # Agar vazifa takrorlanuvchi bo'lsa va muddati bo'lsa
         if ("Har kuni" in recurring or "Har haftada" in recurring) and deadline_str:
             try:
                 dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
@@ -317,9 +390,34 @@ async def delete_task_callback(callback: types.CallbackQuery):
     conn.close()
     await callback.message.edit_text("🗑 <b>Vazifa o'chirildi.</b>", parse_mode="HTML")
 
+# ---------- STATISTIKA ----------
+@dp.message(Command("stats"))
+@dp.message(F.text == "Statistika")
+async def stats_handler(message: types.Message, state: FSMContext):
+    await state.clear() # <- Qotib qolgan jarayonlarni tozalaydi
+    try:
+        conn = sqlite3.connect('todo.db')
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND status != -1", (message.from_user.id,))
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND status=1", (message.from_user.id,))
+        done = c.fetchone()[0]
+        conn.close()
+        
+        pending = total - done
+        text = (f"📊 <b>Umumiy Statistikangiz:</b>\n\n"
+                f"📝 Jami vazifalar: {total}\n"
+                f"✅ Bajarilganlari: {done}\n"
+                f"⏳ Kutilayotgan vazifalar: {pending}")
+        await message.answer(text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Statistika xatosi: {e}")
+        await message.answer("⚠ Statistikani hisoblashda xatolik yuz berdi.", reply_markup=main_kb)
+
 # ---------- EXPORT (CSV YUKLASH) ----------
 @dp.message(Command("export"))
-async def export_handler(message: types.Message):
+async def export_handler(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     conn = sqlite3.connect('todo.db')
     c = conn.cursor()
@@ -337,10 +435,9 @@ async def export_handler(message: types.Message):
         writer.writerow(["ID", "Vazifa nomi", "Kategoriya", "Muhimligi", "Takrorlanish", "Muddat", "Holati (0=Faol, 1=Bajarilgan)"])
         writer.writerows(tasks)
 
-    # Excelda ham oson ochiladigan faylni yuborish
     doc = FSInputFile(filename)
     await message.answer_document(doc, caption="📊 Barcha vazifalaringiz tarixi (Excel/CSV formatida)")
-    os.remove(filename) # Xotira to'lmasligi uchun jo'natib bo'lgach o'chiramiz
+    os.remove(filename)
 
 # ---------- ORQA FONDAGI ESLATMA VA DIGEST ----------
 async def task_scheduler():
