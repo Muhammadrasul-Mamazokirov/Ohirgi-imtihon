@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import random
 import sqlite3
 import asyncio
@@ -16,7 +15,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 
 # ==================== SOZLAMALAR ====================
 load_dotenv()
@@ -26,11 +25,13 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# ==================== BAZA VA JSON SOZLAMALARI ====================
+# ==================== BAZA SOZLAMALARI ====================
 def init_db():
     try:
         conn = sqlite3.connect('quiz.db')
         c = conn.cursor()
+        
+        # Natijalar jadvali
         c.execute('''CREATE TABLE IF NOT EXISTS results (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER,
@@ -40,6 +41,18 @@ def init_db():
                         grade TEXT,
                         date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )''')
+                    
+        # Savollar jadvali (YANGI QO'SHILDI)
+        c.execute('''CREATE TABLE IF NOT EXISTS questions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        question TEXT,
+                        opt_a TEXT,
+                        opt_b TEXT,
+                        opt_c TEXT,
+                        opt_d TEXT,
+                        answer TEXT
+                    )''')
+                    
         conn.commit()
     except Exception as e:
         logging.error(f"Baza xatosi: {e}")
@@ -47,17 +60,45 @@ def init_db():
         conn.close()
 
 def load_questions():
-    if not os.path.exists('questions.json'):
-        with open('questions.json', 'w', encoding='utf-8') as f:
-            json.dump([], f)
-    with open('questions.json', 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """Barcha savollarni quiz.db bazasidan o'qib kelish"""
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    c.execute("SELECT question, opt_a, opt_b, opt_c, opt_d, answer FROM questions")
+    rows = c.fetchall()
+    conn.close()
+    
+    questions = []
+    for row in rows:
+        questions.append({
+            "question": row[0],
+            "options": [row[1], row[2], row[3], row[4]],
+            "answer": row[5]
+        })
+    return questions
 
 def save_questions(new_questions):
-    data = load_questions()
-    data.extend(new_questions)
-    with open('questions.json', 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    """Yangi savollarni quiz.db bazasiga saqlash"""
+    conn = sqlite3.connect('quiz.db')
+    c = conn.cursor()
+    for q in new_questions:
+        opts = q["options"]
+        c.execute('''INSERT INTO questions (question, opt_a, opt_b, opt_c, opt_d, answer) 
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (q["question"], opts[0], opts[1], opts[2], opts[3], q["answer"]))
+    conn.commit()
+    conn.close()
+
+# ==================== BOT MENYUSINI O'RNATISH ====================
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="help", description="Qo'llanma va fayl shablonlari"),
+        BotCommand(command="quiz", description="Yangi testni boshlash"),
+        BotCommand(command="add", description="Ruchnoy savol qo'shish"),
+        BotCommand(command="results", description="Oxirgi natijalarim"),
+        BotCommand(command="cancel", description="Boshlangan amalni bekor qilish")
+    ]
+    await bot.set_my_commands(commands)
 
 # ==================== KEYBOARDLAR ====================
 main_kb = ReplyKeyboardMarkup(
@@ -104,7 +145,6 @@ async def finish_quiz(message_or_call, state: FSMContext, forced=False):
     correct_answers = data.get('correct_answers', 0)
     current_index = data.get('current_index', 0)
     
-    # Agar hech qanday savolga javob bermay to'xtatsa
     if forced and current_index == 0:
         text = "⚠ Siz hali hech qanday savolga javob bermadingiz. Test bekor qilindi."
         if isinstance(message_or_call, types.CallbackQuery):
@@ -114,7 +154,6 @@ async def finish_quiz(message_or_call, state: FSMContext, forced=False):
         await state.clear()
         return
 
-    # To'xtatilgan yoki to'liq tugagan paytdagi jami ishlangan savollar
     total = current_index
     percent = round((correct_answers / total) * 100, 2)
     
@@ -168,27 +207,37 @@ async def send_next_question(message_or_call, state: FSMContext):
     else:
         await message_or_call.answer(text, parse_mode="HTML", reply_markup=kb)
 
-
-# ==================== FAYLLARDAN O'QISH MANTIG'I ====================
+# ==================== AQLLI FAYL O'QISH MANTIG'I ====================
 def parse_text_block(text):
     questions = []
-    blocks = re.split(r'(?i)Savol:', text)[1:]
+    blocks = re.split(r'\n\s*(?:(?i)Savol:|\d+[\.\)])\s*', "\n" + text)
     for block in blocks:
+        if not block.strip(): continue
         try:
-            q_text = block.split('A)')[0].strip()
-            a_match = re.search(r'A\)(.*?)(?=B\))', block, re.DOTALL | re.IGNORECASE).group(1).strip()
-            b_match = re.search(r'B\)(.*?)(?=C\))', block, re.DOTALL | re.IGNORECASE).group(1).strip()
-            c_match = re.search(r'C\)(.*?)(?=D\))', block, re.DOTALL | re.IGNORECASE).group(1).strip()
-            d_match = re.search(r'D\)(.*?)(?=Javob:)', block, re.DOTALL | re.IGNORECASE).group(1).strip()
-            ans_match = re.search(r'(?i)Javob:\s*([A-D])', block).group(1).strip().upper()
-            
-            opts_dict = {'A': a_match, 'B': b_match, 'C': c_match, 'D': d_match}
-            questions.append({
-                "question": q_text,
-                "options": [a_match, b_match, c_match, d_match],
-                "answer": opts_dict[ans_match]
-            })
-        except: pass
+            opts_match = re.findall(r'(?i)\n?\s*([\*\+]?)([A-D])[\)\.](.*?)(?=\n\s*[\*\+]?[A-D][\)\.]|\n\s*(?:Javob|To\'g\'ri)|$)', block, re.DOTALL)
+            if len(opts_match) >= 4:
+                q_text = re.split(r'(?i)\n?\s*[\*\+]?A[\)\.]', block)[0].strip()
+                options = []
+                correct_ans = None
+                for marker, letter, opt_text in opts_match[:4]: 
+                    clean_opt = opt_text.strip()
+                    options.append(clean_opt)
+                    if marker in ['*', '+']: 
+                        correct_ans = clean_opt
+                if not correct_ans:
+                    ans_match = re.search(r'(?i)(?:Javob|To\'g\'ri|Javobi)[\s:]*([A-D])', block)
+                    if ans_match:
+                        ans_letter = ans_match.group(1).upper()
+                        idx = {'A':0, 'B':1, 'C':2, 'D':3}[ans_letter]
+                        correct_ans = options[idx]
+                if q_text and len(options) == 4 and correct_ans:
+                    questions.append({
+                        "question": q_text,
+                        "options": options,
+                        "answer": correct_ans
+                    })
+        except Exception:
+            pass
     return questions
 
 def parse_excel(filepath):
@@ -206,26 +255,68 @@ def parse_excel(filepath):
                     "options": opts,
                     "answer": correct
                 })
-            except: pass
+            except Exception:
+                pass
     return questions
 
-# ==================== HANDLERLAR ====================
+# ==================== ASOSIY COMMANDLAR VA HANDLERLAR ====================
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Assalomu alaykum! Imtihon va Test botiga xush kelibsiz.", reply_markup=main_kb)
+    await message.answer("Assalomu alaykum! Imtihon va Test botiga xush kelibsiz.\n\n"
+                         "Qo'llanma bilan tanishish uchun /help buyrug'ini bosing.", reply_markup=main_kb)
 
-# ---------- 1. TEST ISHLASH ----------
+# ---------- YORDAM (HELP) ----------
+@dp.message(Command("help"))
+async def help_handler(message: types.Message):
+    text = (
+        "📖 <b>Quiz Bot Qo'llanmasi:</b>\n\n"
+        "<b>Asosiy buyruqlar:</b>\n"
+        "🔹 /quiz — Testni boshlash\n"
+        "🔹 /add — Bitta savol qo'shish (ruchnoy)\n"
+        "🔹 /results — Oxirgi natijalarni ko'rish\n"
+        "🔹 /cancel — Har qanday jarayonni bekor qilish\n\n"
+        "📁 <b>Fayl yuklash qoidalari (PDF/Word):</b>\n"
+        "Savollaringiz quyidagi 2 ta usuldan birida bo'lishi kerak:\n\n"
+        "<i>1-usul (Yulduzcha orqali - tavsiya etiladi):</i>\n"
+        "1. O'zbekiston poytaxti qayer?\n"
+        "A. Samarqand\n"
+        "*B. Toshkent\n"
+        "C. Buxoro\n"
+        "D. Navoiy\n\n"
+        "<i>2-usul (Javob orqali):</i>\n"
+        "Savol: O'zbekiston poytaxti qayer?\n"
+        "A) Samarqand\n"
+        "B) Toshkent\n"
+        "C) Buxoro\n"
+        "D) Navoiy\n"
+        "Javob: B"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+# ---------- BEKOR QILISH (CANCEL) ----------
+@dp.message(Command("cancel"))
+@dp.message(F.text == "❌ Bekor qilish")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Hozircha bekor qilinadigan jarayon yo'q.", reply_markup=main_kb)
+        return
+    await state.clear()
+    await message.answer("❌ Jarayon to'xtatildi. Bosh menyudasiz.", reply_markup=main_kb)
+
+# ---------- 1. TEST ISHLASH VA TO'XTATISH ----------
+@dp.message(Command("quiz"))
 @dp.message(F.text == "🎯 Testni boshlash")
 async def start_quiz_handler(message: types.Message, state: FSMContext):
+    await state.clear()
     all_questions = load_questions()
     if not all_questions:
-        await message.answer("⚠ Savollar bazasi bo'sh! Avval savol qo'shing.")
+        await message.answer("⚠ Savollar bazasi bo'sh! Avval savol qo'shing yoki fayl yuklang.")
         return
 
     random.shuffle(all_questions)
-    # Barcha savollarni aralashtirib beradi (Tugaguncha)
     await state.update_data(questions=all_questions, current_index=0, correct_answers=0)
     await state.set_state(QuizState.testing)
     
@@ -257,19 +348,17 @@ async def process_answer(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text(result_text, parse_mode="HTML")
         await state.update_data(current_index=current_index + 1)
         await send_next_question(callback, state)
-    except: pass
-    finally: await callback.answer()
+    except Exception:
+        pass
+    finally:
+        await callback.answer()
 
-# ---------- 2. RUCHNOY SAVOL QO'SHISH (Ortga qaytish bilan) ----------
+# ---------- 2. RUCHNOY SAVOL QO'SHISH ----------
+@dp.message(Command("add"))
 @dp.message(F.text == "➕ Savol qo'shish")
 async def add_q_start(message: types.Message, state: FSMContext):
     await message.answer("📝 Yangi savol matnini kiriting:", reply_markup=back_cancel_kb)
     await state.set_state(AddQState.q_text)
-
-@dp.message(F.text == "❌ Bekor qilish")
-async def cancel_add(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Jarayon bekor qilindi.", reply_markup=main_kb)
 
 @dp.message(AddQState.q_text)
 async def add_q_text(message: types.Message, state: FSMContext):
@@ -320,7 +409,7 @@ async def add_q_d(message: types.Message, state: FSMContext):
     
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="A"), KeyboardButton(text="B")], 
                                        [KeyboardButton(text="C"), KeyboardButton(text="D")],
-                                       [KeyboardButton(text="🔙 Ortga")]], resize_keyboard=True)
+                                       [KeyboardButton(text="🔙 Ortga"), KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     await message.answer("To'g'ri javobni tanlang (A, B, C yoki D):", reply_markup=kb)
     await state.set_state(AddQState.correct_ans)
 
@@ -349,16 +438,14 @@ async def add_q_correct(message: types.Message, state: FSMContext):
     await message.answer("✅ Savol muvaffaqiyatli bazaga qo'shildi!", reply_markup=main_kb)
     await state.clear()
 
-# ---------- 3. FAYL ORQALI YUKLASH (EXCEL, WORD, PDF) ----------
+# ---------- 3. FAYL ORQALI YUKLASH ----------
 @dp.message(F.text == "📁 Fayldan yuklash")
 async def upload_start(message: types.Message, state: FSMContext):
     text = ("📥 <b>Faylni botga yuboring (.pdf, .docx, .xlsx)</b>\n\n"
             "📌 <i>Excel shabloni:</i>\n"
-            "1-ustun: Savol, 2..5-ustunlar: A,B,C,D variantlar, 6-ustun: To'g'ri javob (A,B,C,D yoki matni)\n\n"
-            "📌 <i>Word/PDF shabloni:</i>\n"
-            "Savol: Matn\n"
-            "A) Variant 1\nB) Variant 2\nC) Variant 3\nD) Variant 4\n"
-            "Javob: A\n\n(Bekor qilish uchun ❌ Bekor qilish bosing)")
+            "1-ustun: Savol | 2..5-ustunlar: A,B,C,D | 6-ustun: Javob\n\n"
+            "Shablonlarni to'liq ko'rish uchun /help ni bosing.\n\n"
+            "(Bekor qilish uchun ❌ Bekor qilish yoki /cancel bosing)")
     await message.answer(text, parse_mode="HTML", reply_markup=back_cancel_kb)
     await state.set_state(UploadState.waiting_file)
 
@@ -394,7 +481,7 @@ async def process_file(message: types.Message, state: FSMContext):
             save_questions(questions_added)
             await msg.edit_text(f"✅ Fayldan muvaffaqiyatli <b>{len(questions_added)} ta</b> savol bazaga qo'shildi!", parse_mode="HTML")
         else:
-            await msg.edit_text("⚠ Fayl ichidan bironta ham shablonga mos savol topilmadi. Shablonni to'g'rilab qayta urinib ko'ring.")
+            await msg.edit_text("⚠ Fayl ichidan shablonga mos savol topilmadi. Shablonni tekshirib qayta urinib ko'ring (/help).")
     except Exception as e:
         await msg.edit_text(f"❌ Faylni o'qishda xatolik yuz berdi: {e}")
     finally:
@@ -405,8 +492,10 @@ async def process_file(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ---------- NATIJALAR ----------
+@dp.message(Command("results"))
 @dp.message(F.text == "📊 Natijalarim")
-async def my_results_handler(message: types.Message):
+async def my_results_handler(message: types.Message, state: FSMContext):
+    await state.clear()
     conn = sqlite3.connect('quiz.db')
     c = conn.cursor()
     c.execute("SELECT score, total, percent, grade, date FROM results WHERE user_id=? ORDER BY id DESC LIMIT 5", (message.from_user.id,))
@@ -428,9 +517,10 @@ async def my_results_handler(message: types.Message):
 # ==================== MAIN ====================
 async def main():
     init_db()
-    load_questions() # Fayl yo'q bo'lsa yaratib qo'yadi
+    # json modulini import qilganmiz, lekin endi ishlatmaymiz. Eski json faylni o'qish funksiyasi olib tashlandi.
+    await set_bot_commands(bot)
     try:
-        print("Quiz Bot fayl yuklash tizimi bilan ishga tushdi...")
+        print("🚀 Super Quiz Bot (DB only + Commands + Smart Parser) ishga tushdi...")
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Bot kutilmaganda to'xtadi: {e}")
