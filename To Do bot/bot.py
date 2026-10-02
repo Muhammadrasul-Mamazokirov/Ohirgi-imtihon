@@ -2,24 +2,22 @@ import os
 import sqlite3
 import asyncio
 import logging
-from datetime import datetime
+import csv
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile
 
-# .env fayldan token va muhit o'zgaruvchilarini yuklash
+# ==================== SOZLAMALAR ====================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Bot va Dispatcher yaratish
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
-# Logging sozlamalari
 logging.basicConfig(level=logging.INFO)
 
 # ==================== BAZA SOZLAMALARI ====================
@@ -27,19 +25,48 @@ def init_db():
     try:
         conn = sqlite3.connect('todo.db')
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        digest_date TEXT DEFAULT ''
+                    )''')
         c.execute('''CREATE TABLE IF NOT EXISTS tasks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER,
                         name TEXT,
                         deadline TEXT,
-                        status INTEGER DEFAULT 0
+                        status INTEGER DEFAULT 0,
+                        notified INTEGER DEFAULT 0
                     )''')
+        
+        # Yangi funksiyalar uchun ustunlarni avtomatik qo'shish (eski baza bilan ishlashi uchun)
+        new_columns = [
+            ("category", "TEXT DEFAULT '➕ Boshqa'"),
+            ("priority", "TEXT DEFAULT '🟢 Past'"),
+            ("recurring", "TEXT DEFAULT '❌ Bir marta'")
+        ]
+        for col_name, col_type in new_columns:
+            try:
+                c.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass # Ustun allaqachon bo'lsa, davom etadi
+        
         conn.commit()
     except Exception as e:
         logging.error(f"Baza xatosi: {e}")
     finally:
         conn.close()
+
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="help", description="Qo'llanma"),
+        BotCommand(command="add", description="Yangi vazifa"),
+        BotCommand(command="list", description="Faol vazifalar"),
+        BotCommand(command="stats", description="Statistika"),
+        BotCommand(command="export", description="Vazifalarni Excel(CSV) orqali yuklash"),
+        BotCommand(command="cancel", description="Jarayonni bekor qilish")
+    ]
+    await bot.set_my_commands(commands)
 
 # ==================== KEYBOARDLAR ====================
 main_kb = ReplyKeyboardMarkup(
@@ -50,169 +77,332 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-def task_kb(task_id):
+# FSM (Vazifa qo'shish) uchun Reply tugmalar
+cat_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="💼 Ish"), KeyboardButton(text="📚 O'qish")], [KeyboardButton(text="🏠 Uy"), KeyboardButton(text="🛒 Xaridlar"), KeyboardButton(text="➕ Boshqa")]], resize_keyboard=True)
+prio_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔴 Yuqori")], [KeyboardButton(text="🟡 O'rtacha")], [KeyboardButton(text="🟢 Past")]], resize_keyboard=True)
+rec_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bir marta")], [KeyboardButton(text="🔄 Har kuni"), KeyboardButton(text="📅 Har haftada")]], resize_keyboard=True)
+
+def task_action_kb(task_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"done_{task_id}"),
-                InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del_{task_id}")
-            ]
+            [InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"done_{task_id}"), InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del_{task_id}")],
+            [InlineKeyboardButton(text="✏️ Tahrirlash (Vaqti va Nomi)", callback_data=f"edit_{task_id}")]
         ]
     )
+
+def reminder_kb(task_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"done_{task_id}")],
+            [InlineKeyboardButton(text="💤 15 daqiqa kuting", callback_data=f"snooze_15_{task_id}"), InlineKeyboardButton(text="💤 1 soat kuting", callback_data=f"snooze_60_{task_id}")]
+        ]
+    )
+
+def pagination_kb(page, total_pages):
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"page_{page-1}"))
+    buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton(text="Oldinga ➡", callback_data=f"page_{page+1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 # ==================== FSM HOLATLARI ====================
 class TaskStates(StatesGroup):
     name = State()
+    category = State()
+    priority = State()
+    recurring = State()
     deadline = State()
 
+class EditTaskStates(StatesGroup):
+    task_id = State()
+    name = State()
+    deadline = State()
+
+# ==================== YORDAMCHI FUNKSIYALAR ====================
+def priority_value(prio_str):
+    if "Yuqori" in prio_str: return 1
+    if "O'rtacha" in prio_str: return 2
+    return 3
+
+def get_tasks_text(user_id, page=1, limit=5):
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, deadline, category, priority, recurring FROM tasks WHERE user_id=? AND status=0", (user_id,))
+    tasks = c.fetchall()
+    conn.close()
+
+    if not tasks:
+        return "🎉 Sizda hozircha faol vazifalar yo'q!", None
+
+    # Muhimligi (priority) bo'yicha saralash
+    tasks.sort(key=lambda x: priority_value(x[4]))
+    
+    total_pages = (len(tasks) + limit - 1) // limit
+    if page > total_pages: page = total_pages
+    
+    start_idx = (page - 1) * limit
+    page_tasks = tasks[start_idx:start_idx + limit]
+
+    text = f"📋 <b>Sizning faol vazifalaringiz (Sahifa: {page}/{total_pages}):</b>\n\n"
+    for task in page_tasks:
+        t_id, name, deadline, cat, prio, rec = task
+        dl_text = deadline if deadline else "Vaqt yo'q"
+        text += f"🆔 <b>ID: {t_id}</b> | {prio} | {cat}\n📝 {name}\n⏳ {dl_text} | 🔄 {rec}\n〰〰〰〰〰〰〰〰〰〰〰\n"
+    
+    text += "\n👇 <i>Vazifani boshqarish uchun chatga uning <b>ID raqamini</b> yuboring.</i>"
+    kb = pagination_kb(page, total_pages) if total_pages > 1 else None
+    return text, kb
+
 # ==================== HANDLERLAR ====================
-
 @dp.message(CommandStart())
-async def start_handler(message: types.Message):
-    try:
-        conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
-        conn.commit()
-        conn.close()
-        await message.answer("Assalomu alaykum! Todo botga xush kelibsiz. Quyidagi menyudan foydalaning:", reply_markup=main_kb)
-    except Exception as e:
-        logging.error(f"/start xatosi: {e}")
+async def start_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    conn = sqlite3.connect('todo.db')
+    conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
+    conn.commit()
+    conn.close()
+    await message.answer("Premium Todo Botga xush kelibsiz! /help orqali qo'llanmani o'qing.", reply_markup=main_kb)
 
+@dp.message(Command("cancel"))
+async def cancel_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Jarayon bekor qilindi.", reply_markup=main_kb)
+
+# ---------- VAZIFA QO'SHISH (Zanjirli qadamlar) ----------
+@dp.message(Command("add"))
 @dp.message(F.text == "Vazifa qo'shish")
 async def add_task_start(message: types.Message, state: FSMContext):
-    await message.answer("Yangi vazifa nomini kiriting:")
+    await message.answer("📝 <b>Yangi vazifa nomini kiriting:</b>", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(TaskStates.name)
 
 @dp.message(TaskStates.name)
 async def process_task_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("Muddatni kiriting (KK.OO.YYYY) yoki \"O'tkazib yuborish\" deb yozing:")
+    await message.answer("📂 <b>Kategoriyani tanlang:</b>", parse_mode="HTML", reply_markup=cat_kb)
+    await state.set_state(TaskStates.category)
+
+@dp.message(TaskStates.category)
+async def process_task_cat(message: types.Message, state: FSMContext):
+    await state.update_data(category=message.text)
+    await message.answer("🔥 <b>Muhimlik darajasini tanlang:</b>", parse_mode="HTML", reply_markup=prio_kb)
+    await state.set_state(TaskStates.priority)
+
+@dp.message(TaskStates.priority)
+async def process_task_prio(message: types.Message, state: FSMContext):
+    await state.update_data(priority=message.text)
+    await message.answer("🔄 <b>Vazifa takrorlanishini tanlang:</b>", parse_mode="HTML", reply_markup=rec_kb)
+    await state.set_state(TaskStates.recurring)
+
+@dp.message(TaskStates.recurring)
+async def process_task_rec(message: types.Message, state: FSMContext):
+    await state.update_data(recurring=message.text)
+    await message.answer("⏳ <b>Muddatni kiriting (KK.OO.YYYY SS:MM)</b>\n<i>Masalan: 05.10.2026 14:30</i>\nYoki \"O'tkazib yuborish\" deb yozing:", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(TaskStates.deadline)
 
 @dp.message(TaskStates.deadline)
 async def process_task_deadline(message: types.Message, state: FSMContext):
     text = message.text
     deadline = None
-    
-    if text != "O'tkazib yuborish":
+    if text.lower() != "o'tkazib yuborish":
         try:
-            # Sani tekshirish
-            dt = datetime.strptime(text, "%d.%m.%Y")
-            if dt.date() < datetime.now().date():
-                await message.answer("O'tib ketgan sana kiritdingiz! Iltimos, kelajakdagi sanani yoki \"O'tkazib yuborish\" so'zini kiriting:")
+            dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+            if dt < datetime.now():
+                await message.answer("⚠ O'tib ketgan vaqt! Kelajakdagi vaqtni kiriting:")
                 return
             deadline = text
         except ValueError:
-            await message.answer("Noto'g'ri format! Iltimos, KK.OO.YYYY formatida yozing yoki \"O'tkazib yuborish\" deb kiriting:")
+            await message.answer("⚠ Noto'g'ri format! (KK.OO.YYYY SS:MM) formatida yozing:")
             return
 
     data = await state.get_data()
-    name = data['name']
-
     try:
         conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("INSERT INTO tasks (user_id, name, deadline) VALUES (?, ?, ?)",
-                  (message.from_user.id, name, deadline))
+        conn.execute("INSERT INTO tasks (user_id, name, category, priority, recurring, deadline) VALUES (?, ?, ?, ?, ?, ?)",
+                  (message.from_user.id, data['name'], data['category'], data['priority'], data['recurring'], deadline))
         conn.commit()
         conn.close()
-        
-        await message.answer("✅ Vazifa muvaffaqiyatli qo'shildi!", reply_markup=main_kb)
+        await message.answer("✅ <b>Vazifa muvaffaqiyatli qo'shildi!</b>", parse_mode="HTML", reply_markup=main_kb)
         await state.clear()
     except Exception as e:
-        logging.error(f"Vazifa saqlashda xato: {e}")
-        await message.answer("Xatolik yuz berdi. Iltimos qayta urinib ko'ring.")
-        await state.clear()
+        logging.error(f"Save error: {e}")
 
+# ---------- VAZIFALARIM RO'YXATI VA SAHIFALASH ----------
+@dp.message(Command("list"))
 @dp.message(F.text == "Vazifalarim")
 async def my_tasks_handler(message: types.Message):
-    try:
-        conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("SELECT id, name, deadline FROM tasks WHERE user_id=? AND status=0", (message.from_user.id,))
-        tasks = c.fetchall()
-        conn.close()
+    text, kb = get_tasks_text(message.from_user.id, page=1)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-        if not tasks:
-            await message.answer("🎉 Sizda hozircha faol vazifalar yo'q. Dam olishingiz mumkin!")
-            return
+@dp.callback_query(F.data.startswith("page_"))
+async def page_callback(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[1])
+    text, kb = get_tasks_text(callback.from_user.id, page=page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-        for task in tasks:
-            t_id, name, deadline = task
-            dl_text = deadline if deadline else "Biriktirilmagan"
-            text = f"📌 <b>Vazifa:</b> {name}\n⏳ <b>Muddat:</b> {dl_text}"
-            
-            await message.answer(text, parse_mode="HTML", reply_markup=task_kb(t_id))
-    except Exception as e:
-        logging.error(f"Vazifalarim qismida xato: {e}")
+# ---------- VAZIFA ID SI KIRITILGANDA ----------
+@dp.message(F.text.regexp(r'^\d+$'))
+async def task_id_handler(message: types.Message):
+    task_id = int(message.text)
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT name, deadline, category, priority, recurring FROM tasks WHERE id=? AND user_id=? AND status=0", (task_id, message.from_user.id))
+    task = c.fetchone()
+    conn.close()
 
+    if task:
+        name, deadline, cat, prio, rec = task
+        dl_text = deadline if deadline else "Biriktirilmagan"
+        text = (f"📌 <b>Tanlangan vazifa (ID: {task_id}):</b>\n\n"
+                f"📝 <b>Nomi:</b> {name}\n"
+                f"📂 <b>Kategoriya:</b> {cat}\n"
+                f"🔥 <b>Muhimlik:</b> {prio}\n"
+                f"🔄 <b>Takrorlanish:</b> {rec}\n"
+                f"⏳ <b>Muddat:</b> {dl_text}\n\nQanday amal bajaramiz?")
+        await message.answer(text, parse_mode="HTML", reply_markup=task_action_kb(task_id))
+    else:
+        await message.answer("⚠ Bunday ID raqamli faol vazifa topilmadi.")
+
+# ---------- CALLBACKLAR (Bajarildi, Snooze, Tahrir) ----------
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done_callback(callback: types.CallbackQuery):
     task_id = int(callback.data.split("_")[1])
-    try:
-        conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("UPDATE tasks SET status=1 WHERE id=? AND user_id=?", (task_id, callback.from_user.id))
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT deadline, recurring FROM tasks WHERE id=?", (task_id,))
+    task = c.fetchone()
+    
+    if task:
+        deadline_str, recurring = task
+        # Agar vazifa takrorlanuvchi bo'lsa va muddati bo'lsa
+        if ("Har kuni" in recurring or "Har haftada" in recurring) and deadline_str:
+            try:
+                dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
+                new_dt = dt + timedelta(days=1) if "Har kuni" in recurring else dt + timedelta(days=7)
+                new_dl = new_dt.strftime("%d.%m.%Y %H:%M")
+                c.execute("UPDATE tasks SET deadline=?, notified=0 WHERE id=?", (new_dl, task_id))
+                conn.commit()
+                await callback.message.edit_text(f"✅ Bajarildi! Vazifa takrorlanuvchi bo'lgani uchun keyingi muddatga o'tkazildi: <b>{new_dl}</b>", parse_mode="HTML")
+            except: pass
+        else:
+            c.execute("UPDATE tasks SET status=1 WHERE id=?", (task_id,))
+            conn.commit()
+            await callback.message.edit_text(f"✅ <b>Bajarildi! (ID: {task_id})</b>\n\n<s>Vazifa yakunlandi.</s>", parse_mode="HTML")
+    conn.close()
 
-        # Xabarni tahrirlash (yangi xabar yubormaslik)
-        await callback.message.edit_text(
-            f"✅ <b>Bajarildi!</b>\n\n<s>{callback.message.text}</s>", 
-            parse_mode="HTML", 
-            reply_markup=None
-        )
-    except Exception as e:
-        logging.error(f"Done callback xatosi: {e}")
-    finally:
-        await callback.answer("Vazifa bajarilgan deb belgilandi!")
+@dp.callback_query(F.data.startswith("snooze_"))
+async def snooze_callback(callback: types.CallbackQuery):
+    _, mins, task_id = callback.data.split("_")
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT deadline FROM tasks WHERE id=?", (task_id,))
+    task = c.fetchone()
+    if task and task[0]:
+        try:
+            dt = datetime.now() + timedelta(minutes=int(mins))
+            new_dl = dt.strftime("%d.%m.%Y %H:%M")
+            c.execute("UPDATE tasks SET deadline=?, notified=0 WHERE id=?", (new_dl, task_id))
+            conn.commit()
+            await callback.message.edit_text(f"💤 Vazifa <b>{mins} daqiqaga</b> kechiktirildi. Vaqti kelsa yana eslataman!", parse_mode="HTML")
+        except: pass
+    conn.close()
 
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_task_callback(callback: types.CallbackQuery):
     task_id = int(callback.data.split("_")[1])
-    try:
-        conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM tasks WHERE id=? AND user_id=?", (task_id, callback.from_user.id))
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect('todo.db')
+    conn.execute("UPDATE tasks SET status=-1 WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text("🗑 <b>Vazifa o'chirildi.</b>", parse_mode="HTML")
 
-        # Xabarni o'chirildi degan yozuvga o'zgartirish
-        await callback.message.edit_text("🗑 <b>Vazifa o'chirildi.</b>", parse_mode="HTML", reply_markup=None)
-    except Exception as e:
-        logging.error(f"Delete callback xatosi: {e}")
-    finally:
-        await callback.answer("O'chirildi!")
+# ---------- EXPORT (CSV YUKLASH) ----------
+@dp.message(Command("export"))
+async def export_handler(message: types.Message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect('todo.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, category, priority, recurring, deadline, status FROM tasks WHERE user_id=?", (user_id,))
+    tasks = c.fetchall()
+    conn.close()
 
-@dp.message(F.text == "Statistika")
-async def stats_handler(message: types.Message):
-    try:
-        conn = sqlite3.connect('todo.db')
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id=?", (message.from_user.id,))
-        total = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND status=1", (message.from_user.id,))
-        done = c.fetchone()[0]
-        conn.close()
+    if not tasks:
+        await message.answer("Sizda yuklab olish uchun vazifalar yo'q.")
+        return
 
-        pending = total - done
-        text = (f"📊 <b>Statistikangiz:</b>\n\n"
-                f"📝 Jami vazifalar: {total}\n"
-                f"✅ Bajarilgan: {done}\n"
-                f"⏳ Qolgan vazifalar: {pending}")
-        await message.answer(text, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Statistika xatosi: {e}")
+    filename = f"todo_tarix_{user_id}.csv"
+    with open(filename, mode='w', newline='', encoding='utf-8-sig') as file:
+        writer = csv.writer(file)
+        writer.writerow(["ID", "Vazifa nomi", "Kategoriya", "Muhimligi", "Takrorlanish", "Muddat", "Holati (0=Faol, 1=Bajarilgan)"])
+        writer.writerows(tasks)
 
-# ==================== BOTNI ISHGA TUSHIRISH ====================
+    # Excelda ham oson ochiladigan faylni yuborish
+    doc = FSInputFile(filename)
+    await message.answer_document(doc, caption="📊 Barcha vazifalaringiz tarixi (Excel/CSV formatida)")
+    os.remove(filename) # Xotira to'lmasligi uchun jo'natib bo'lgach o'chiramiz
+
+# ---------- ORQA FONDAGI ESLATMA VA DIGEST ----------
+async def task_scheduler():
+    while True:
+        try:
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            conn = sqlite3.connect('todo.db')
+            c = conn.cursor()
+
+            # 1. 08:00 DA ERTALABKI XULOSA (MORNING DIGEST)
+            if now.hour == 8:
+                c.execute("SELECT user_id FROM users WHERE digest_date != ? OR digest_date IS NULL", (today_str,))
+                users_to_digest = c.fetchall()
+                
+                for u in users_to_digest:
+                    uid = u[0]
+                    c.execute("SELECT name FROM tasks WHERE user_id=? AND status=0 AND deadline LIKE ?", (uid, f"{now.strftime('%d.%m.%Y')}%"))
+                    todays_tasks = c.fetchall()
+                    
+                    if todays_tasks:
+                        txt = f"🌅 <b>Xayrli tong! Bugun bajarilishi kerak bo'lgan vazifalar ({len(todays_tasks)} ta):</b>\n\n"
+                        for i, t in enumerate(todays_tasks, 1):
+                            txt += f"{i}. {t[0]}\n"
+                        txt += "\n<i>Kuningiz barakali o'tsin!</i> ☕"
+                        try:
+                            await bot.send_message(uid, txt, parse_mode="HTML")
+                        except: pass
+                    
+                    c.execute("UPDATE users SET digest_date=? WHERE user_id=?", (today_str, uid))
+                    conn.commit()
+
+            # 2. VAZIFALAR VAQTI KELGANDA ESLATISH
+            c.execute("SELECT id, user_id, name, deadline FROM tasks WHERE status=0 AND notified=0 AND deadline IS NOT NULL")
+            tasks = c.fetchall()
+            
+            for task in tasks:
+                t_id, uid, name, deadline_str = task
+                try:
+                    dt = datetime.strptime(deadline_str, "%d.%m.%Y %H:%M")
+                    if now >= dt:
+                        text = f"⏰ <b>ESLATMA! Vaqti keldi!</b>\n\n📝 <b>Vazifa:</b> {name}"
+                        await bot.send_message(uid, text, parse_mode="HTML", reply_markup=reminder_kb(t_id))
+                        c.execute("UPDATE tasks SET notified=1 WHERE id=?", (t_id,))
+                        conn.commit()
+                except ValueError: pass
+            
+            conn.close()
+        except Exception as e:
+            logging.error(f"Scheduler xatosi: {e}")
+        await asyncio.sleep(60)
+
+# ==================== MAIN ====================
 async def main():
     init_db()
+    await set_bot_commands(bot)
+    asyncio.create_task(task_scheduler())
     try:
-        print("Bot ishga tushdi...")
+        print("🚀 SUPER PREMUM Todo Bot ishga tushdi...")
         await dp.start_polling(bot)
     except Exception as e:
-        logging.error(f"Bot to'xtab qoldi: {e}")
+        logging.error(f"Bot kutilmaganda to'xtadi: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
